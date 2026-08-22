@@ -296,29 +296,27 @@ impl LeaderboardContract {
             }
 
             // Issue #100: the min cache must track the REAL smallest entry.
-            // After an in-place update the changed entry landed at `current`;
-            // if it dropped below the cached min (it can now sit below the
-            // tail, leaving the list unsorted below it) it IS the new min.
-            // Only then is the tail (slot count-1) recomputed, which is the
-            // correct min whenever the updated entry rose instead.
-            let min_points: u64 = env.storage().instance().get(&DataKey::MinPoints).unwrap_or(0);
-            let updated: PlayerEntry = env
-                .storage()
-                .persistent()
-                .get(&DataKey::TopPlayerAt(current))
-                .unwrap();
-            if updated.points < min_points {
-                env.storage().instance().set(&DataKey::MinPoints, &updated.points);
-                env.storage().instance().set(&DataKey::MinSlot, &current);
-            } else if count > 0 {
-                let min_slot = count - 1;
-                let min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &min_slot);
+            // After bubble_up, the list is sorted above `current` but may
+            // be unsorted below it (bubble_up only sorts upward). The tail
+            // is NOT guaranteed to be the minimum — we must scan the entire
+            // list to find the true minimum.
+            if count > 0 {
+                let mut min_slot_found: u32 = 0;
+                let mut min_pts_found: u64 = u64::MAX;
+                for i in 0..count {
+                    if let Some(e) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(i))
+                    {
+                        if e.points < min_pts_found {
+                            min_pts_found = e.points;
+                            min_slot_found = i;
+                        }
+                    }
+                }
+                env.storage().instance().set(&DataKey::MinPoints, &min_pts_found);
+                env.storage().instance().set(&DataKey::MinSlot, &min_slot_found);
             }
             return;
         }

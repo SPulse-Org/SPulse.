@@ -9,6 +9,12 @@ const WELCOME_BONUS_POINTS: u64 = 5;
 const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
 
+/// Maximum allowed depth of the referral chain. A new registration whose
+/// referrer already sits at depth MAX_REFERRAL_DEPTH is rejected. This bounds
+/// both gas usage during the on-chain traversal and sybil-amplification attack
+/// surface (issue #100, group 4).
+const MAX_REFERRAL_DEPTH: u32 = 5;
+
 // Issue #100 invariant matrix (incentive/reward group).
 const _: () = assert!(WELCOME_BONUS_POINTS > 0);
 const _: () = assert!(REFERRAL_BET_POINTS > 0);
@@ -24,6 +30,10 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    // Issue #99: the address given as `referrer` has never registered.
+    ReferrerNotRegistered = 7,
+    // Issue #100: referral chain exceeds maximum depth.
+    ReferralDepthExceeded = 8,
 }
 
 #[contracttype]
@@ -127,6 +137,12 @@ impl ReferralRegistryContract {
         if let Some(ref ref_addr) = referrer {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
+            }
+            // Issue #100: enforce referral chain depth limit to bound gas
+            // usage and sybil-amplification attack surface.
+            let depth = Self::referral_depth(env.clone(), ref_addr.clone());
+            if depth >= MAX_REFERRAL_DEPTH {
+                return Err(ReferralError::ReferralDepthExceeded);
             }
         }
         // Lever A: write ONE packed Profile entry (display_name + referrer)
@@ -331,6 +347,29 @@ impl ReferralRegistryContract {
             return Err(ReferralError::UnauthorizedCaller);
         }
         Ok(())
+    }
+
+    /// Issue #100: walk the referral chain from `addr` upward, counting
+    /// how many ancestors exist. Returns 0 if `addr` has no referrer,
+    /// 1 if their referrer has no referrer, etc. Capped at
+    /// MAX_REFERRAL_DEPTH + 1 to bound gas usage.
+    fn referral_depth(env: &Env, addr: &Address) -> u32 {
+        let mut depth: u32 = 0;
+        let mut current = addr.clone();
+        while depth <= MAX_REFERRAL_DEPTH {
+            let profile: Option<UserProfile> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Profile(current));
+            match profile.and_then(|p| p.referrer) {
+                Some(ref_addr) => {
+                    current = ref_addr;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+        depth
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), ReferralError> {

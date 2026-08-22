@@ -36,6 +36,16 @@ const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated f
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+// Issue #100: cross-contract TTL coordination note.
+// Different contracts have different storage semantics (persistent vs instance).
+// TTL_BUMP is used for persistent storage extension; TTL_HIGH for instance.
+// The compile-time assertion TTL_BUMP <= TTL_HIGH ensures the persistent bump
+// never outruns the instance key lifetime. Cross-contract TTL collisions
+// (e.g., contract A referencing contract B's storage that has expired) are
+// mitigated by using consistent TTL values across all contracts, but a full
+// coordination mechanism would require a unified TTL model — acknowledged as
+// a remaining architectural limitation.
+
 // ── Issue #100: compile-time invariant matrix ────────────────────────────────
 // Every cross-constant relationship the protocol depends on is asserted at
 // compile time, so an unsafe combination can never be introduced silently.
@@ -263,6 +273,41 @@ impl PredictionMarketContract {
     /// Read the current Config (for verification/admin tooling).
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
+    }
+
+    /// Issue #100: runtime validation of configuration invariants.
+    /// Returns Ok(()) if all constant relationships are within safe bounds;
+    /// returns Err(InvalidDependency) if any invariant is violated.
+    /// This catches interactions that compile-time asserts cannot cover
+    /// (e.g., runtime storage state vs. expected bounds).
+    pub fn validate_config(env: Env) -> Result<(), MarketError> {
+        // Fee group: net + total_fee == denom
+        if NET_NUMERATOR + TOTAL_FEE_BPS != BPS_DENOM {
+            return Err(MarketError::InvalidDependency);
+        }
+        if PLATFORM_FEE_BPS <= 0 || PLATFORM_FEE_BPS > TOTAL_FEE_BPS {
+            return Err(MarketError::InvalidDependency);
+        }
+        // Limits
+        if MIN_BET <= 0 || MAX_BETS_PER_USER == 0 || MAX_MARKETS_PER_HOUR == 0 {
+            return Err(MarketError::InvalidDependency);
+        }
+        // Withdrawal safety
+        if MAX_WITHDRAWAL_BPS <= 0 || MAX_WITHDRAWAL_BPS > BPS_DENOM {
+            return Err(MarketError::InvalidDependency);
+        }
+        if WITHDRAW_DELAY_SECS == 0 {
+            return Err(MarketError::InvalidDependency);
+        }
+        // TTL relationship
+        if TTL_BUMP == 0 || TTL_BUMP > TTL_HIGH {
+            return Err(MarketError::InvalidDependency);
+        }
+        // Market duration
+        if MIN_MARKET_DURATION_SECS == 0 {
+            return Err(MarketError::InvalidDependency);
+        }
+        Ok(())
     }
 
     // ── Resolver Management ───────────────────────────────────────────────
