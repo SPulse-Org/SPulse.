@@ -137,12 +137,13 @@ pub struct Config {
 // ── BetEntry: bet + gross + stake in one slot ──────────────────────────────
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+// ── BetEntry: two-sided position + Gross + BetCount in one slot ────────────
 pub struct BetEntry {
-    pub net: i128,        // post-fee amount bet (used for payout)
-    pub gross: i128,      // pre-fee amount sent (used for cancel_refund)
+    pub net_yes: i128,   // post-fee net committed to YES (used for payout)
+    pub net_no: i128,    // post-fee net committed to NO (used for payout)
+    pub gross: i128,     // pre-fee total sent across both sides (used for cancel_refund)
     pub refundable: i128, // net + platform fee + referral fee (iff never paid out)
                           // — EXACTLY what the contract still holds for this bet
-    pub is_yes: bool,
     pub claimed: bool,
     pub count: u32, // how many times this user has bet on this market
 }
@@ -189,6 +190,17 @@ pub struct Market {
 // Kept for ABI compatibility — frontend reads Bet fields
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Full two-sided position view — exposes both sides of a user's bet.
+pub struct Position {
+    pub net_yes: i128,
+    pub net_no: i128,
+    pub gross: i128,
+    pub claimed: bool,
+    pub count: u32,
+}
+
+// Kept for ABI compatibility — frontend reads Bet fields.
+// For a two-sided position, amount/is_yes report the dominant side.
 pub struct Bet {
     pub amount: i128,
     pub is_yes: bool,
@@ -451,13 +463,10 @@ impl PredictionMarketContract {
         let bet_key = DataKey::Bet(market_id, user.clone());
         let existing: Option<BetEntry> = env.storage().persistent().get(&bet_key);
 
-        // Spam guard + side check combined from single read
+        // Spam guard (side check removed — two-sided positions allowed, issue #14)
         if let Some(ref e) = existing {
             if e.count >= MAX_BETS_PER_USER {
                 return Err(MarketError::TooManyBets);
-            }
-            if e.is_yes != is_yes {
-                return Err(MarketError::OppositeSideBet);
             }
         }
 
@@ -536,20 +545,24 @@ impl PredictionMarketContract {
             .persistent()
             .extend_ttl(&mkt_fees_key, TTL_BUMP, TTL_HIGH);
 
-        // ── Write BetEntry (net + gross + refundable + count in one write) ──
+        // ── Write BetEntry (two-sided net + gross + count in one write) ──
         let new_entry = match existing {
             Some(mut e) => {
-                e.net += net;
+                if is_yes {
+                    e.net_yes += net;
+                } else {
+                    e.net_no += net;
+                }
                 e.gross += amount;
                 e.refundable += net + held_fees;
                 e.count += 1;
                 e
             }
             None => BetEntry {
-                net,
+                net_yes: if is_yes { net } else { 0 },
+                net_no: if is_yes { 0 } else { net },
                 gross: amount,
                 refundable: net + held_fees,
-                is_yes,
                 claimed: false,
                 count: 1,
             },
@@ -669,8 +682,13 @@ impl PredictionMarketContract {
                     };
                 let bet_key = DataKey::Bet(market_id, bettor.clone());
                 if let Some(entry) = env.storage().persistent().get::<DataKey, BetEntry>(&bet_key) {
-                    if entry.is_yes == outcome {
-                        let payout = (entry.net * total_pool) / winning_side;
+                    // Two-sided positions: pay out the winning side only.
+                    // A user with bets on both sides gets paid for whichever
+                    // side matches the outcome; the losing side's net stays
+                    // in the pool (counted in total_pool already).
+                    let entry_net = if outcome { entry.net_yes } else { entry.net_no };
+                    if entry_net > 0 {
+                        let payout = (entry_net * total_pool) / winning_side;
                         let payout_key = DataKey::Payout(market_id, bettor.clone());
                         env.storage().persistent().set(&payout_key, &payout);
                         env.storage()
@@ -770,7 +788,8 @@ impl PredictionMarketContract {
         // Issue #100: the fee portion of this refund (platform + held referral)
         // is drained from AccumulatedFees — exactly this market's own share,
         // never another market's.
-        let fee_share = refundable - entry.net;
+        let total_net = entry.net_yes + entry.net_no;
+        let fee_share = refundable - total_net;
         let mut acc_fees: i128 = env
             .storage()
             .instance()
@@ -829,12 +848,9 @@ impl PredictionMarketContract {
             return Err(MarketError::AlreadyClaimed);
         }
 
-        let is_winner = entry.is_yes == market.outcome;
-        let winning_side = if market.outcome {
-            market.total_yes
-        } else {
-            market.total_no
-        };
+        // Two-sided positions: the Payout ledger already contains the exact
+        // payout computed at resolve_market time for the winning side.
+        // No need to check is_yes — the payout is 0 for the losing side.
 
         // SECURITY: mark claimed BEFORE any external calls.
         entry.claimed = true;
@@ -864,13 +880,20 @@ impl PredictionMarketContract {
         } else {
             0
         };
-        if is_winner && payout > 0 {
+        if payout > 0 {
             token::Client::new(&env, &cfg.xlm_sac).transfer(&this, &user, &payout);
         }
 
         // All participants earn PULSE tokens + leaderboard points regardless.
-        // When winning_side == 0, "winners" receive loser-tier rewards (no competition).
-        let real_win = is_winner && winning_side > 0;
+        // With two-sided positions, payout > 0 means the user had net on the
+        // winning side; winning_side == 0 means no contest (everyone gets
+        // loser-tier rewards).
+        let winning_side = if market.outcome {
+            market.total_yes
+        } else {
+            market.total_no
+        };
+        let real_win = payout > 0 && winning_side > 0;
         let (points, tokens): (u64, i128) = if real_win {
             (WIN_POINTS, WIN_TOKENS)
         } else {
@@ -1071,10 +1094,28 @@ impl PredictionMarketContract {
             .persistent()
             .get(&DataKey::Bet(market_id, user))
             .ok_or(MarketError::NoBetFound)?;
+        // Two-sided: report the dominant side for backward-compatible view.
+        let dominant = e.net_yes >= e.net_no;
         Ok(Bet {
-            amount: e.net,
-            is_yes: e.is_yes,
+            amount: if dominant { e.net_yes } else { e.net_no },
+            is_yes: dominant,
             claimed: e.claimed,
+        })
+    }
+
+    /// Full two-sided position view for a user on a market.
+    pub fn get_position(env: Env, market_id: u64, user: Address) -> Result<Position, MarketError> {
+        let e: BetEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bet(market_id, user))
+            .ok_or(MarketError::NoBetFound)?;
+        Ok(Position {
+            net_yes: e.net_yes,
+            net_no: e.net_no,
+            gross: e.gross,
+            claimed: e.claimed,
+            count: e.count,
         })
     }
 
