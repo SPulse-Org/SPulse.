@@ -558,6 +558,22 @@ fn test_reduce_then_cancel_refund_pays_remaining_gross() {
 
     // Market is then cancelled: refund covers only the 60 XLM still held.
     t.client.cancel_market(&t.admin, &id);
+    assert!(t.client.get_market(&id).cancelled);
+
+    // Issue #100: fees are NOT zeroed at cancel time — they are released
+    // exactly as each bettor's refund drains its own share.
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000); // 2 + 1 XLM
+
+    // Each bettor pulls their own refund (full gross — no referrer involved)
+    let alice_refund = t.client.cancel_refund(&alice, &id);
+    assert_eq!(alice_refund, 100_0000000); // full gross (100 XLM)
+    assert_eq!(t.xlm.balance(&alice), alice_before);
+    assert_eq!(t.client.get_accumulated_fees(), 1_0000000);
+
+    let bob_refund = t.client.cancel_refund(&bob, &id);
+    assert_eq!(bob_refund, 50_0000000); // full gross (50 XLM)
+    assert_eq!(t.xlm.balance(&bob), bob_before);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
     let refunded = t.client.cancel_refund(&user, &id);
     assert_eq!(refunded, 60_0000000);
     assert_eq!(t.client.get_bet_gross(&id, &user), 0);
@@ -1147,6 +1163,88 @@ fn test_reject_claim_unresolved() {
     // must trip MAX_BETS_PER_USER instead of BetTooSmall.
     for _ in 0..=20u32 {
         t.client.place_bet(&user, &id, &true, &20_0000000_i128);
+    }
+}
+
+// ── 32. Market creation rate limiting ────────────────────────────────────────
+
+#[test]
+fn test_market_creation_rate_limit_allows_up_to_max() {
+    let t = setup();
+    // Should be able to create up to MAX_MARKETS_PER_HOUR (10) in the same window
+    for i in 0..10u32 {
+        let _ = t.client.create_market(
+            &t.admin,
+            &String::from_str(&t.env, "Market"),
+            &String::from_str(&t.env, "https://x.png"),
+            &Category::Crypto,
+            &(3600_u64 + i as u64),
+        );
+    }
+    assert_eq!(t.client.get_market_count(), 10);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_market_creation_rate_limit_exceeded() {
+    let t = setup();
+    // Create 10 markets (the limit)
+    for i in 0..10u32 {
+        let _ = t.client.create_market(
+            &t.admin,
+            &String::from_str(&t.env, "Market"),
+            &String::from_str(&t.env, "https://x.png"),
+            &Category::Crypto,
+            &(3600_u64 + i as u64),
+        );
+    }
+    // 11th should fail
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Over limit"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Sports,
+        &7200_u64,
+    );
+}
+
+#[test]
+fn test_market_creation_rate_limit_resets_after_window() {
+    let t = setup();
+    for i in 0..10u32 {
+        let _ = t.client.create_market(
+            &t.admin,
+            &String::from_str(&t.env, "Market"),
+            &String::from_str(&t.env, "https://x.png"),
+            &Category::Crypto,
+            &(3600_u64 + i as u64),
+        );
+    }
+    // Advance past the 1-hour window
+    advance_time(&t.env, 3601);
+    // Should be able to create again
+    let id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "New window market"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Sports,
+        &7200_u64,
+    );
+    assert_eq!(id, 11);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_market_creation_rate_limit_rejects_timestamp_regression() {
+    let t = setup();
+    for i in 0..10u32 {
+        let _ = t.client.create_market(
+            &t.admin,
+            &String::from_str(&t.env, "Market"),
+            &String::from_str(&t.env, "https://x.png"),
+            &Category::Crypto,
+            &(3600_u64 + i as u64),
+        );
     }
     fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
@@ -3044,6 +3142,23 @@ fn test_resolve_market_emits_event() {
     assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_resolved"));
 }
 
+    // Two bets accumulate fees
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 2 XLM fee
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 2 XLM fee
+    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+
+    // Issue #100: cancellation does NOT steal from the accumulator — the
+    // fees stay attributed to this market until each refund drains exactly
+    // its own share (net + platform + held referral = full gross here, since
+    // no referrer is involved).
+    t.client.cancel_market(&t.admin, &id);
+    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+
+    // Each refund releases exactly that bet's fee share.
+    t.client.cancel_refund(&alice, &id);
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    t.client.cancel_refund(&bob, &id);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
 // ═══════════════════════════════════════════════════════════════════════════
 // SECURITY REGRESSION SUITE — issue #95 (pause / circuit breaker)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3163,6 +3278,27 @@ fn test_pause_keeps_cancel_refund_available() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.cancel_market(&t.admin, &id); // cancelled BEFORE the pause
 
+    // Create second market, bet, then cancel — verify claim-style refund
+    let market2 = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Will DOGE hit $1?"),
+        &String::from_str(&t.env, "https://doge.png"),
+        &Category::Crypto,
+        &7200_u64,
+    );
+    let charlie = Address::generate(&t.env);
+    fund_user(&t, &charlie, 500_0000000);
+    let charlie_before = t.xlm.balance(&charlie);
+    t.client
+        .place_bet(&charlie, &market2, &true, &100_0000000_i128);
+    t.client.cancel_market(&t.admin, &market2);
+    // Issue #100: market2's fees stay attributed until Charlie's refund
+    // drains exactly his share (full gross — no referrer involved).
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    let refunded = t.client.cancel_refund(&charlie, &market2);
+    assert_eq!(refunded, 100_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+    assert_eq!(t.xlm.balance(&charlie), charlie_before);
     t.client.set_paused(&t.admin, &true);
     let before = t.xlm.balance(&user);
     let refunded = t.client.cancel_refund(&user, &id);
@@ -3474,4 +3610,135 @@ fn test_config_governance_full_happy_path() {
     let new_hashes = t.client.get_pinned_hashes().unwrap();
     assert_eq!(new_hashes.leaderboard, hashes.unwrap().leaderboard);
 }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #100 (systemic configuration invariants)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── 100a. Cancellation releases ONLY this market's fee share; another
+//          market's accumulated fees are untouched (fee-reclaim inversion
+//          from the old `net * 200bps` formula is gone) ────────────────────
+#[test]
+fn test_cancel_refund_isolates_market_fees() {
+    let t = setup();
+    let m1 = create_test_market(&t);
+    let m2 = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    fund_user(&t, &alice, 2_000_0000000);
+
+    t.client.place_bet(&alice, &m1, &true, &100_0000000_i128); // 2 XLM fee
+    t.client.place_bet(&alice, &m2, &true, &100_0000000_i128); // 2 XLM fee
+    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+
+    // Cancelling m1 must NOT consume m2's fees.
+    t.client.cancel_market(&t.admin, &m1);
+    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+    assert_eq!(t.client.get_market_fees(&m1), 2_0000000);
+
+    t.client.cancel_refund(&alice, &m1); // drains exactly m1's 2 XLM
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    assert_eq!(t.client.get_market_fees(&m2), 2_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), t.client.get_market_fees(&m2));
+}
+
+// ── 100b. Refund consistency: referrer-backed bet refunds only what the
+//          contract holds (net + platform); no-referrer bet refunds 100% ──
+#[test]
+fn test_cancel_refund_respects_referrer_holdings() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    fund_user(&t, &user, 2_000_0000000);
+
+    // Referrer-backed bet: 0.5% referral fee was PAID OUT at bet time.
+    t.referral_client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Bettor"),
+        &Some(referrer.clone()),
+    );
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    assert_eq!(t.xlm.balance(&referrer), 5000000);
+
+    t.client.cancel_market(&t.admin, &id);
+    let with_ref = t.client.cancel_refund(&user, &id);
+    // 100 XLM gross − 0.5 XLM referral paid out = 99.5 XLM refundable.
+    assert_eq!(with_ref, 99_5000000);
+    assert_eq!(t.xlm.balance(&referrer), 5000000); // not clawed back
+    assert_eq!(t.client.get_accumulated_fees(), 0); // platform drained
+
+    // No-referrer bet on a second market (fresh user): full gross comes back.
+    let id2 = create_test_market(&t);
+    let solo = Address::generate(&t.env);
+    fund_user(&t, &solo, 1_000_0000000);
+    t.client.place_bet(&solo, &id2, &true, &100_0000000_i128);
+    t.client.cancel_market(&t.admin, &id2);
+    let no_ref = t.client.cancel_refund(&solo, &id2);
+    assert_eq!(no_ref, 100_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+}
+
+// ── 100c. Fee decomposition invariant: for any bet, the sum of what the
+//          contract holds (refundable) equals net + all held fees, and the
+//          global accumulator equals the per-market provenance sum ────────
+#[test]
+fn test_fee_provenance_invariant_holds() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 2_000_0000000);
+    fund_user(&t, &bob, 2_000_0000000);
+
+    t.client.place_bet(&alice, &id, &true, &77_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &33_0000000_i128);
+
+    // Total fee == gross - net for each bet; accumulator == Σ market fees.
+    let alice_gross = t.client.get_bet_gross(&id, &alice);
+    let alice_net = t.client.get_bet(&id, &alice).amount;
+    let bob_gross = t.client.get_bet_gross(&id, &bob);
+    let bob_net = t.client.get_bet(&id, &bob).amount;
+    let total_fees = (alice_gross - alice_net) + (bob_gross - bob_net);
+    assert_eq!(t.client.get_accumulated_fees(), total_fees);
+    assert_eq!(t.client.get_accumulated_fees(), t.client.get_market_fees(&id));
+
+    // Refundable (contract-held per user) == gross for no-referrer bets.
+    t.client.cancel_market(&t.admin, &id);
+    assert_eq!(t.client.cancel_refund(&alice, &id), alice_gross);
+    assert_eq!(t.client.cancel_refund(&bob, &id), bob_gross);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+}
+
+// ── 100d. MIN_BET is a NET requirement (98%): boundary exactly at the
+//          threshold; one stroop below is rejected ─────────────────────────
+#[test]
+fn test_min_bet_net_threshold_boundary() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 10_000_0000000);
+
+    // gross 10_204_081 → net 9_999_999 < MIN_BET → rejected
+    assert!(t.client.try_place_bet(&user, &id, &true, &10_204_081_i128).is_err());
+    // gross 10_204_082 → net 10_000_000 == MIN_BET → accepted
+    t.client.place_bet(&user, &id, &true, &10_204_082_i128);
+    assert_eq!(t.client.get_bet(&id, &user).amount, 10_000_000);
+}
+
+// ── 100e. Resolution sweep provenance: swept user principal counts toward
+//          the market's fee ledger (empty winning side) ────────────────────
+#[test]
+fn test_sweep_provenance_recorded() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 1_000_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128); // fees 2.0
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &false); // YES wins? no: NO side empty → sweep
+
+    // NO side is empty → whole pool (98) swept; provenance == fees + sweep.
+    assert_eq!(t.client.get_market_fees(&id), 2_0000000 + 98_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), 100_0000000);
 }

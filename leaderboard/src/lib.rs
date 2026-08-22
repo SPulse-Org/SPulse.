@@ -16,10 +16,12 @@ pub const MAX_TOP_PLAYERS: u32 = 50;
 /// (issue #91). Callers should treat `rank > MAX_TOP_PLAYERS` as "not ranked".
 pub const UNRANKED_RANK: u32 = MAX_TOP_PLAYERS + 1;
 const MAX_TOP_PLAYERS: u32 = 50;
-const MAX_PAGE_SIZE: u32 = 20;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+// Issue #100 invariant matrix (compile-time).
+const _: () = assert!(MAX_TOP_PLAYERS > 0);
+const _: () = assert!(TTL_BUMP > 0 && TTL_BUMP <= TTL_HIGH);
 // ── Point decay (issue #69) ──────────────────────────────────────────────────
 //
 // Points used to only ever increase, which made the board a cumulative
@@ -1453,8 +1455,28 @@ impl LeaderboardContract {
         }
     }
 
-            // Update min points/slot if this was the last slot.
+            // Issue #100: the min cache must track the REAL smallest entry.
+            // After bubble_up, the list is sorted above `current` but may
+            // be unsorted below it (bubble_up only sorts upward). The tail
+            // is NOT guaranteed to be the minimum — we must scan the entire
+            // list to find the true minimum.
             if count > 0 {
+                let mut min_slot_found: u32 = 0;
+                let mut min_pts_found: u64 = u64::MAX;
+                for i in 0..count {
+                    if let Some(e) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(i))
+                    {
+                        if e.points < min_pts_found {
+                            min_pts_found = e.points;
+                            min_slot_found = i;
+                        }
+                    }
+                }
+                env.storage().instance().set(&DataKey::MinPoints, &min_pts_found);
+                env.storage().instance().set(&DataKey::MinSlot, &min_slot_found);
                 let min_slot = count - 1;
                 let min_entry: PlayerEntry = env
                     .storage()

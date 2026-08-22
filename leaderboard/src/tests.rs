@@ -514,6 +514,40 @@ fn test_reward_updates_points_and_winloss() {
     assert_eq!(s.total_bets, 2);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #100 — leaderboard capacity invariant: MinPoints/MinSlot must always
+// equal the true minimum of the filled list, so evictions are never wrong.
+// (MAX_TOP_PLAYERS x stale cache was the unsafe parameter interaction.)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_min_cache_matches_true_minimum_at_capacity() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    // Fill the list to MAX_TOP_PLAYERS with ascending points (slot 0 highest).
+    for i in 0..50u32 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &(500 - i), &true);
+    }
+    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_min_points(), 451); // 500 - 49
+    assert_eq!(client.get_min_slot(), 49);
+
+    // A newcomer below the true min must be rejected (cache is not stale).
+    let below = Address::generate(&env);
+    client.add_pts(&market, &below, &450, &true);
+    assert_eq!(client.get_player_count(), 50); // still 50 — rejected
+    assert_eq!(client.get_min_points(), 451);
+
+    // A newcomer above the min is admitted and becomes the new min.
+    let above = Address::generate(&env);
+    client.add_pts(&market, &above, &500, &true);
+    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_min_points(), 451); // 500 inserts above all? No:
+    // 500 > 451 => replaces min, then bubbles up to its sorted position.
+    let slots = client.get_top_players(0, 50);
+    assert_eq!(slots.len(), 50);
+    assert!(slots.get(0).unwrap().points >= slots.get(49).unwrap().points);
 // ── Issue #22: TopPlayerSlot ↔ TopPlayerAt integrity ─────────────────────────
 
 #[test]
